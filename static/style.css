@@ -44,6 +44,22 @@ body {
 .save-state.saved { color: var(--normal); }
 .save-state.saving { color: var(--warn); }
 .save-state.error { color: var(--error); }
+.save-state.conflict { color: var(--error); font-weight: 600; }
+
+/* ---------- 版本冲突横幅 ---------- */
+.conflict-banner {
+  grid-column: 1 / -1;
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 14px; flex-wrap: wrap;
+  padding: 10px 14px;
+  border: 1px solid var(--error);
+  background: rgba(239, 91, 107, 0.12);
+  border-radius: 10px;
+}
+.conflict-banner[hidden] { display: none; }
+.conflict-text { display: flex; flex-direction: column; gap: 3px; font-size: 12px; line-height: 1.6; }
+.conflict-text b { color: var(--error); }
+.conflict-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 
 /* ---------- 布局 ---------- */
 .layout {

@@ -139,7 +139,7 @@ docker compose up --build -d
 REST API 与页面同端口、以 `/api/...` 为前缀，例如：
 
 > - 页面：`GET  http://localhost:8000/`
-> - 状态：`GET/PUT http://localhost:8000/api/state`
+> - 状态：`GET/PUT http://localhost:8000/api/state`（读取带版本号，保存用 `If-Match` 乐观锁，冲突返回 409）
 > - 抗倾覆试算：`POST http://localhost:8000/api/overturn`（只读）
 > - 逐层装货顺序规划：`POST http://localhost:8000/api/loading-sequence`（只读）
 > - 连续窑门通行试算：`POST http://localhost:8000/api/door-passage`（只读）
@@ -186,7 +186,10 @@ HOST_PORT=9000
 
 1. **录入架体**：左侧面板自下而上编辑台面尺寸、各层棚板（位置/尺寸/自重）、
    坯件重量与立柱（底端坐标/容量）；任意修改约 250 ms 后整架自动重算并保存，
-   顶栏显示保存状态，刷新页面不丢数据。
+   顶栏显示保存状态，刷新页面不丢数据。同一窑车在**多个页面/标签**同时编辑时，
+   保存携带读取时的架体版本；若期间已被其他页面保存，本页**保留未保存草稿**并在
+   顶部红字提示版本冲突（不会显示“已保存”），可选择放弃编辑载入最新架体，或
+   保留草稿强制覆盖（详见下方「多页面并发编辑」一节）。
 2. **查看结果**：右侧俯视图 / 侧视图实时刷新；点击立柱或棚板查看载荷来源链；
    「告警与判定」列出悬空、落点重叠、超载、无支撑等问题，点击条目可定位到
    对应立柱/棚板。
@@ -314,8 +317,8 @@ python -m pytest -q
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/api/state` | 读取当前架体输入（首次自动生成示例） |
-| `PUT` | `/api/state` | 保存架体 JSON，并返回整架重算结果（前端每次编辑调用） |
+| `GET` | `/api/state` | 读取当前架体输入（首次自动生成示例）；响应头 `ETag` / `X-Frame-Version` 给出当前架体版本号（正整数） |
+| `PUT` | `/api/state` | 保存架体 JSON，并返回整架重算结果（前端每次编辑调用）。支持**乐观锁版本**：请求头 `If-Match: "版本号"`（也支持 `X-Frame-Version` 头或 body 顶层 `version` 字段）携带读取时版本，服务端在一次加锁写入中核对——匹配才提交完整架体并把版本 +1；不匹配返回 **HTTP 409**，body 含 `{"conflict": true, "version": 最新版本, "state": 最新已保存架体, "result": 其重算结果}`，不写入任何内容。不带版本的调用按原语义执行（总是写入），但版本同样 +1；`If-Match: *` 表示不校验版本强制写入 |
 | `POST` | `/api/recalc` | 仅重算：body 传架体 JSON（不传则用已保存状态） |
 | `GET` | `/api/result` | 已保存状态的重算结果 |
 | `POST` | `/api/simulate` | 立柱失效推演：body `{"state": 架体JSON(可省), "failed": [{"layer": 0, "post": "P1"}]}`，返回 `{baseline, simulation, failed, diff}`（基准/推演/生效失效柱/差值）；**只计算，不写盘**，失效标记不持久化 |
@@ -325,7 +328,88 @@ python -m pytest -q
 | `POST` | `/api/loading-sequence` | 逐层装货顺序规划（只读）：body `{"state": 架体JSON(可省), "ax": 0.1, "ay": 0}`（水平加速度分量，单位 g，默认 0）；保留全部棚板自重、坯件先全部置零，再取坯件重量大于零的层（`candidates`，至多 12）按整层一次加入，对各已装子集（含初始状态）求与 `/api/overturn` 相同的带符号裕量，用位掩码动态规划求全过程最小裕量最大的加入顺序 `order`（同分按层序号字典序），返回逐步 `steps`（新增层/累计坯件重量/总重/重心/投影/裕量/`verdict`/`stable`）、`minMargin`、`minMarginStep` 与 `allStable`（任一步非正即 false）；无有效承托、底层支撑凸包退化、初始棚板总重为 0、空架或无可装层、候选层超过 12 时 `planable=false` 并给出 `reason`；加速度非数值返回 400；**不写盘、不改已保存状态** |
 | `POST` | `/api/door-passage` | 连续窑门通行试算（只读）：body `{"state": 架体JSON(可省), "doors": [{center,width,height,maxShift}, ...]}`，窑门按行进顺序排列，字段为开口横向中心、宽度、高度与进入该门前本段最大横移量（单位 mm），首门从横移 0 出发；由台面与各棚板 X 向跨度给 `profile`（`totalHeight`=累加层高、`envelope`、逐件 `slabs`），逐门返回本门可通过横移闭区间 `interval`、上一可达区间扩张后的 `reachExpanded`、两者交集 `reachable` 与阻断信息；门高 < 最高点时 `blockReason="height"` 直接阻断（无 `interval`），本门区间自身为空为 `"width"`，扩张后与本门区间无交为 `"reach"`（附 `conflict`：两个区间与缺口）；首次空交集即 `passable=false`、`blockedAt` 指向阻断门、其后各门 `evaluated=false`；全程可达时 `positions` 给出回溯的每门选定横移 `shift`、本段移动 `move`（≤ `maxShift`）与左/右/顶部净空 `clearance`；空门列表按可达处理（附 `note`）；没有任何层时 `evaluable=false` 并给出 `reason`；`doors` 非数组、字段非有限数值、宽度/高度非正或横移量为负返回 400；**不写盘、不改已保存状态** |
 | `POST` | `/api/wheel-load` | 轮组承载试算（只读）：body `{"state": 架体JSON(可省), "xLeft","xRight","yFront","yRear"(台面内轮位坐标 mm), "ratedFL","ratedFR","ratedRL","ratedRR"(四轮额定载荷 kg)}；也支持 `{"wheels": {"FL": {"x","y","rating"}, ...}}` 分组形式。以底层非悬空立柱的落点与实载为点载荷（重叠落点合并），按矩形四轮双向杠杆（双线性）比例分配反力，落点越出轮组矩形时允许外推、**负反力不截零**；返回 `trackX/wheelbaseY`、逐轮 `wheels`（`reaction/rating/utilization/overloaded/negative`）、点载荷明细 `pointLoads`（含 `outsideWheelRect` 外推标记）、风险 `risks`（`wheel-overload` / `negative-reaction` / `extrapolation`）与平衡核对 `checks`（`force` 反力之和、`momentX` 绕过前轮 X 轴力矩、`momentY` 绕过左轮 Y 轴力矩，各含反力侧/点载荷侧/`residual`/`ok`）；轮距不正（`xLeft≥xRight`/`yFront≥yRear`）、任一轮位越出台面矩形、额定载荷非正返回 400；没有底层或底层非悬空柱正载荷合计为 0 时 200 + `evaluable=false` 与 `reason`；**不写盘、不改已保存状态** |
-| `POST` | `/api/reset` | 恢复内置示例数据 |
+| `POST` | `/api/reset` | 恢复内置示例数据；无论内容是否变化都把版本 +1（响应同样带 `version` / `ETag`），使重置前发出、携带旧版本的保存事后到达时只会收到 409，不能覆盖重置结果 |
+
+## 多页面并发编辑：架体版本与冲突处理（乐观锁）
+
+同一辆窑车可能在两个页面 / 标签（或两个 API 调用方）同时编辑。架体带有一个
+**单调递增的整数版本号**（保存在 `data/state.meta.json`，架体 JSON 自身的
+`car` / `layers` 结构不变）：
+
+- `GET /api/state` 读取架体时，响应头 `ETag: "3"` 与 `X-Frame-Version: 3`
+  给出当前版本；
+- 保存时用 `If-Match: "3"` 把**读取时的版本**带回服务端，服务端在**一次加锁
+  写入**中完成「核对版本 → 保存完整架体 → 版本 +1」：版本匹配才提交，不匹配
+  返回 **409 Conflict** 且不写入，响应体给出最新已保存架体与版本；
+- `POST /api/reset` 恢复示例时也会把版本 +1（即使内容相同），因此重置前发出、
+  重置后才到达的旧保存会被 409 拒绝，不能事后覆盖示例；
+- **不带版本的调用完全兼容**：直接 `PUT` 架体 JSON 仍按原语义写入，且版本照常
+  +1。`If-Match: *` 表示显式强制覆盖（不校验版本）。
+
+页面端行为：编辑请求串行发送、每个请求携带当前已知版本；若收到 409，左侧
+录入面板**保留未保存草稿**，顶栏显示红色「⚠ 版本冲突：架体已在别处保存，
+草稿未保存」（绝不显示“已保存”，也不用本地试算冒充已保存），结果区展示服务端
+最新已保存架体，并提供两个按钮：**放弃我的编辑，载入最新架体** 或
+**保留我的编辑并强制覆盖**。同一页面连续编辑中较早发出的请求响应不会覆盖
+较新草稿；恢复示例后，在途旧请求的响应一律作废。
+
+读取（注意响应头里的版本号）：
+
+```bash
+curl -s -D - http://localhost:8000/api/state -o /tmp/frame.json
+# HTTP/1.1 200 OK
+# ETag: "3"
+# X-Frame-Version: 3
+```
+
+携带读取时版本保存（匹配 → 提交，版本 +1）：
+
+```bash
+curl -s -D - -X PUT http://localhost:8000/api/state \
+  -H 'Content-Type: application/json' \
+  -H 'If-Match: "3"' \
+  --data @/tmp/frame.json
+# HTTP/1.1 200 OK
+# ETag: "4"
+# X-Frame-Version: 4
+# {"ok": true, "version": 4, "result": { ... }}
+```
+
+另一页面已先保存（版本已到 5），仍带着旧版本 4 的保存被拒绝并返回最新架体：
+
+```bash
+curl -s -i -X PUT http://localhost:8000/api/state \
+  -H 'Content-Type: application/json' \
+  -H 'If-Match: "4"' \
+  --data @/tmp/frame.json
+# HTTP/1.1 409 CONFLICT
+# ETag: "5"
+# X-Frame-Version: 5
+# {"error": "架体版本冲突：您读取的架体已被其他页面/调用方保存，请合并后重试",
+#  "conflict": true,
+#  "version": 5,
+#  "state": { "car": {...}, "layers": [...] },   ← 最新已保存架体（合并基准）
+#  "result": { ... }}                            ← 最新架体的整架重算结果
+```
+
+取 409 中的 `state` 与本地编辑合并后，用响应里的新版本重试即可；确认要以本地
+为准时可强制覆盖（等价于不带版本的老调用方式）：
+
+```bash
+curl -s -X PUT http://localhost:8000/api/state \
+  -H 'Content-Type: application/json' \
+  -H 'If-Match: *' \
+  --data @/tmp/frame.json
+```
+
+版本号也可放在 `X-Frame-Version: 4` 请求头，或架体 body 顶层加
+`"version": 4` 字段（该字段仅用于核对，不会写入架体结构）；版本头无法解析为
+整数时返回 400。恢复示例同样推进版本：
+
+```bash
+curl -s -X POST http://localhost:8000/api/reset
+# {"ok": true, "version": 6, "state": {...示例...}, "result": {...}}
+```
 
 ## 调用示例（轮组承载试算）
 
@@ -517,6 +601,7 @@ curl -i -X POST http://localhost:8000/api/wheel-load \
 │   └── style.css
 ├── data/
 │   └── sample_state.json# 内置示例（悬空/重叠/超载三类工况）
+│   （运行期还会生成 state.json 当前架体、state.meta.json 架体版本号，均不纳入镜像/版本库）
 ├── tests/test_calc.py   # 核心算法单元测试（含失效推演、加柱建议、减载配额、抗倾覆试算、装货顺序规划、窑门通行试算、轮组承载试算）
 ├── Dockerfile           # 依赖与示例数据随镜像一起发布
 ├── docker-compose.yml   # 一条命令启动 + 数据卷持久化

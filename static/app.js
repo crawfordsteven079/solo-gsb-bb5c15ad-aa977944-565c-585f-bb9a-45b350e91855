@@ -7,7 +7,7 @@
 const TOL_MM = 10;
 const LAYER_COLORS = ["#4f9dff", "#34c08a", "#c08bff", "#f0b03c", "#ef5b6b", "#3fd6d6"];
 
-let state = null;        // 输入架体（可编辑）
+let state = null;        // 输入架体（可编辑，可能含未保存/冲突中的草稿）
 let result = null;       // 后端计算结果（基准）
 let simulation = null;   // 失效推演结果（非 null 时视图/明细展示推演值）
 let simDiff = null;      // 基准 vs 推演差异（台面载荷/丢失载荷/逐柱差值/新增问题）
@@ -18,6 +18,21 @@ let sideAxis = "x";
 let recalcTimer = null;
 const topHit = [];       // 俯视图可点击热区
 const sideHit = [];      // 侧视图可点击热区
+
+/* ================= 架体版本（乐观锁） =================
+ * 同一窑车可能在多个页面/标签同时编辑：每次 GET 拿到服务端架体版本，
+ * 保存（PUT）在 If-Match 头里带上读取时的版本；服务端只在版本匹配时提交并
+ * 推进版本，冲突返回 409 + 最新已保存架体。
+ * - 保存为 single-flight：同一时刻只有一个在途 PUT，在途期间的编辑合并为
+ *   一个 pending 草稿，落定后续发（带最新草稿与最新版本），较早请求的响应
+ *   不可能覆盖较新草稿；
+ * - saveEpoch 在「恢复示例」后递增，使重置前发出的在途保存响应一律作废；
+ * - 409 时保留编辑器里的未保存草稿、显示冲突提示，绝不显示“已保存”，
+ *   也不用本地试算冒充保存结果，由用户选择「放弃草稿」或「强制覆盖」。
+ */
+let savedVersion = null; // 最近一次已知的服务端版本（GET/200/409/重置后更新）
+let saveEpoch = 0;       // 保存代数：重置后 +1，旧一代在途响应全部丢弃
+let conflictInfo = null; // {version, serverState, serverResult, draft} 未处理的冲突，null=无冲突
 
 /* ================= 加柱建议状态 =================
  * suggestData 只来自 POST /api/suggest 的试算结果（或离线兜底），绝不写盘；
@@ -133,53 +148,205 @@ function collectState() {
   return state;
 }
 
-/* ================= 重算 + 保存 + 渲染 ================= */
-async function recalcAndRender(applyChange) {
+/* ================= 重算 + 保存 + 渲染 =================
+ * 保存携带读取时版本（If-Match），同一时刻只允许一个在途请求（single-flight）：
+ * 在途期间的连续编辑合并为一个 pending 草稿，待在途请求落定后用最新 DOM 与
+ * 最新版本续发——较早请求的响应不可能覆盖较新草稿（续发携带的就是最新草稿）。
+ * 每个保存项带一个 resolve：被合并掉的较早编辑在合并时即 resolve（其内容已被
+ * 更新草稿包含），真正发出的项在响应落定（或被重置作废）后 resolve。
+ */
+let saveInFlight = false;  // 是否有 PUT 在途
+let savePending = null;    // 在途期间被合并的最新一次待发草稿（保存项）
+
+function makeSaveItem(payload, applyChange, force) {
+  let resolve;
+  const done = new Promise((r) => { resolve = r; });
+  return { payload, applyChange, force: !!force, resolve, done };
+}
+
+function recalcAndRender(applyChange) {
   const payload = collectState();
-  let label = "重算并保存中…";
-  if (applyChange === "suggest") label = "写入新柱并保存中…";
-  if (applyChange === "shed") label = "写入建议坯件重量并保存中…";
-  setSaveState("saving", label);
-  // 架体一经编辑/写盘，之前的加柱试算与减载试算结果即作废（确认写入的那次除外）
+  // 架体一经编辑/写盘，之前的试算结果即作废（确认写入的那次除外）
   if (!applyChange) {
     invalidateSuggestions({ silent: true });
     invalidateShed({ silent: true });
   }
-  // 抗倾覆试算只依赖架体几何/重量：加柱、减载确认写入同样会改变它，任何重算都作废
   invalidateOverturn({ silent: true });
-  // 逐层装货顺序规划同样只依赖架体几何/重量：任何编辑都使旧规划作废
   invalidateSequence({ silent: true });
-  // 连续窑门通行试算只依赖架体几何：任何编辑都使旧试算失效
   invalidateDoorTrial({ silent: true });
-  // 轮组承载试算的点载荷来自底层立柱实载：任何编辑都使旧试算失效
   invalidateWheelTrial({ silent: true });
   suggestAppliedMsg = null;
   if (applyChange !== "shed") shedAppliedMsg = null;
+
+  // 版本冲突尚未处理时不再自动发起保存：草稿原样保留在编辑器中，
+  // 由用户显式选择「放弃草稿」或「强制覆盖」，避免静默覆盖他人编辑。
+  if (conflictInfo) {
+    setSaveState("conflict", "⚠ 存在版本冲突，草稿未保存");
+    renderConflictBanner();
+    return Promise.resolve();
+  }
+
+  setSaveState("saving", "重算并保存中…");
+  if (saveInFlight) {
+    // 合并到 pending：在途请求落定后只发送这一份（最新 DOM + 当时最新版本）。
+    // 被合并掉的旧保存项立即完成——它的内容已被这份更新草稿包含。
+    if (savePending) savePending.resolve();
+    savePending = makeSaveItem(payload, applyChange, false);
+    return savePending.done;
+  }
+  const item = makeSaveItem(payload, applyChange, false);
+  launchSave(item);
+  return item.done;
+}
+
+function launchSave(item) {
+  saveInFlight = true;
+  const epoch = saveEpoch;
+  void putState(item, epoch);
+}
+
+async function putState(item, epoch) {
+  const { payload, force } = item;
+  let res, data;
   try {
-    const res = await fetch("/api/state", {
+    const headers = { "Content-Type": "application/json" };
+    if (force) headers["If-Match"] = "*";               // 用户显式强制覆盖
+    else if (savedVersion != null) headers["If-Match"] = `"${savedVersion}"`;
+    res = await fetch("/api/state", {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify(payload),
     });
-    if (!res.ok) throw new Error("保存失败");
-    const data = await res.json();
+    data = await res.json();
+  } catch (err) {
+    settleSave({ kind: "network", item, epoch });
+    return;
+  }
+  if (res.status === 409 && data && data.conflict) {
+    settleSave({ kind: "conflict", data, item, epoch });
+  } else if (res.ok) {
+    settleSave({ kind: "saved", data, item, epoch });
+  } else {
+    settleSave({ kind: "network", item, epoch });
+  }
+}
+
+function settleSave(outcome) {
+  const { kind, item, epoch } = outcome;
+  const payload = item.payload;
+  const applyChange = item.applyChange;
+  // 「恢复示例」后才落定的旧响应一律丢弃，绝不能覆盖重置结果或状态文案
+  if (epoch !== saveEpoch) {
+    saveInFlight = false;
+    item.resolve();
+    return;
+  }
+
+  if (kind === "conflict") {
+    const { data } = outcome;
+    // 拒绝旧写入：记录服务端最新架体/版本，保留编辑器中未保存的草稿。
+    // 结果区展示最新已保存架体的重算结果（来自服务端），绝不显示“已保存”，
+    // 也不用本地试算掩盖冲突；在途期间合并的 pending 作废，冲突解除前不自动保存。
+    saveInFlight = false;
+    if (savePending) { savePending.resolve(); savePending = null; }
+    conflictInfo = {
+      version: data.version,
+      serverState: data.state,
+      serverResult: data.result,
+      draft: payload,
+    };
+    if (typeof data.version === "number") savedVersion = data.version;
+    result = data.result;
+    selection = selection && stillExists(selection) ? selection : null;
+    simulation = null; simDiff = null; simSeq++;
+    setSaveState("conflict", "⚠ 版本冲突：架体已在别处保存，草稿未保存");
+    renderResults();
+    markLayerBadges();
+    renderConflictBanner();
+    item.resolve();
+    return;
+  }
+
+  // 成功 / 网络错误都先落定本请求；若期间又有更新的草稿被合并，立即按最新版本续发
+  const pending = savePending;
+  savePending = null;
+  saveInFlight = !!pending;
+
+  if (kind === "saved") {
+    const { data } = outcome;
     result = data.result;
     state = payload;
-    setSaveState("saved", "✓ 已重算并保存 " + new Date().toLocaleTimeString("zh-CN"));
-    if (applyChange === "suggest") suggestAppliedMsg = "✓ 新柱已写入架体并触发自动保存";
-    if (applyChange === "shed") shedAppliedMsg = "✓ 建议坯件重量已写入架体并触发自动保存";
-  } catch (err) {
-    setSaveState("error", "保存失败，仅本地重算");
+    conflictInfo = null;
+    if (typeof data.version === "number") savedVersion = data.version;
+  } else {
+    // 网络错误：后端不可达，沿用浏览器内同一套算法本地兜底，并明确“未保存”
     result = calculateLocal(payload);
-    if (applyChange === "suggest") suggestAppliedMsg = "✓ 新柱已加入本地编辑（后端不可用，未能保存）";
-    if (applyChange === "shed") shedAppliedMsg = "✓ 建议坯件重量已加入本地编辑（后端不可用，未能保存）";
+    state = payload;
   }
   selection = selection && stillExists(selection) ? selection : null;
-  // 编辑只更新基准；若正在推演，用同一失效选择在新基准上重跑（失效标记不保存）
-  if (failedSelection.length) await refreshSimulation();
+  if (failedSelection.length) void refreshSimulation();
   else { simulation = null; simDiff = null; }
   renderResults();
   markLayerBadges();
+
+  if (pending) {
+    setSaveState("saving", "重算并保存中…");
+    // 续发携带的是最新草稿与最新版本；当前响应再旧也只对应已被它取代的内容
+    item.resolve();
+    launchSave(pending);
+    return;
+  }
+
+  if (kind === "saved") {
+    setSaveState("saved", "✓ 已重算并保存 " + new Date().toLocaleTimeString("zh-CN"));
+    if (applyChange === "suggest") suggestAppliedMsg = "✓ 新柱已写入架体并触发自动保存";
+    if (applyChange === "shed") shedAppliedMsg = "✓ 建议坯件重量已写入架体并触发自动保存";
+  } else {
+    setSaveState("error", "保存失败（后端不可达），仅本地重算，未保存");
+    if (applyChange === "suggest") suggestAppliedMsg = "✓ 新柱已加入本地编辑（后端不可用，未能保存）";
+    if (applyChange === "shed") shedAppliedMsg = "✓ 建议坯件重量已加入本地编辑（后端不可用，未能保存）";
+  }
+  item.resolve();
+}
+
+/* 冲突横幅：保留草稿 + 两种显式处理方式 */
+function renderConflictBanner() {
+  const banner = $("#conflictBanner");
+  if (!banner) return;
+  if (!conflictInfo) {
+    banner.hidden = true;
+    return;
+  }
+  banner.hidden = false;
+  $("#conflictVersion").textContent = String(conflictInfo.version);
+}
+
+async function discardDraftAndReload() {
+  if (!conflictInfo) return;
+  state = conflictInfo.serverState;
+  result = conflictInfo.serverResult;
+  savedVersion = conflictInfo.version;
+  conflictInfo = null;
+  saveInFlight = false;
+  savePending = null;
+  selection = null;
+  simulation = null; simDiff = null; simSeq++;
+  renderEditor();
+  renderResults();
+  markLayerBadges();
+  renderConflictBanner();
+  setSaveState("saved", "✓ 已载入最新架体 " + new Date().toLocaleTimeString("zh-CN"));
+}
+
+async function forceOverwriteDraft() {
+  if (!conflictInfo) return;
+  const payload = collectState(); // 以编辑器中保留的草稿为准
+  conflictInfo = null;
+  renderConflictBanner();
+  setSaveState("saving", "强制覆盖保存中…");
+  const item = makeSaveItem(payload, null, true);
+  launchSave(item);
+  return item.done;
 }
 
 /* ================= 立柱失效推演 =================
@@ -402,9 +569,23 @@ $("#btnAddLayer").addEventListener("click", () => {
 
 $("#btnReset").addEventListener("click", async () => {
   if (!confirm("恢复为内置示例数据？当前编辑将被覆盖。")) return;
-  const res = await fetch("/api/reset", { method: "POST" });
-  const data = await res.json();
+  let res, data;
+  try {
+    res = await fetch("/api/reset", { method: "POST" });
+    data = await res.json();
+    if (!res.ok) throw new Error("reset failed");
+  } catch (err) {
+    alert("恢复示例失败：无法连接后端服务。");
+    return;
+  }
+  // 重置推进了服务端版本：本页面在重置前发出的在途保存响应必须全部作废，
+  // 不能在迟到后把旧架体/“已保存”状态覆盖回重置结果。
+  saveEpoch++;
+  if (savePending) { savePending.resolve(); savePending = null; }
+  saveInFlight = false;
+  conflictInfo = null;
   state = data.state; result = data.result;
+  savedVersion = typeof data.version === "number" ? data.version : null;
   selection = null;
   failedSelection = []; simulation = null; simDiff = null; simSeq++;
   invalidateSuggestions({ silent: true });
@@ -416,7 +597,18 @@ $("#btnReset").addEventListener("click", async () => {
   suggestAppliedMsg = null;
   shedAppliedMsg = null;
   renderEditor(); renderResults(); markLayerBadges();
+  renderConflictBanner();
   setSaveState("saved", "✓ 已恢复示例 " + new Date().toLocaleTimeString("zh-CN"));
+});
+
+/* 版本冲突：显式处理，绝不静默覆盖 */
+$("#btnDiscardDraft").addEventListener("click", () => {
+  if (!conflictInfo) return;
+  if (confirm("放弃本页未保存的编辑，并载入服务端最新架体？")) void discardDraftAndReload();
+});
+$("#btnForceOverwrite").addEventListener("click", () => {
+  if (!conflictInfo) return;
+  if (confirm("用本页编辑强制覆盖服务端最新架体？其他页面的保存将被覆盖。")) void forceOverwriteDraft();
 });
 
 /* 侧视图切换 */
@@ -2606,11 +2798,14 @@ window.addEventListener("resize", debounce(() => { drawTop(); drawSide(); }, 150
 async function init() {
   setSaveState("", "加载中…");
   try {
-    const res = await fetch("/api/result");
-    const r = await res.json();
-    result = r;
+    // 以 GET /api/state 返回的版本号作为本页面后续保存的乐观锁基准
     const sres = await fetch("/api/state");
     state = await sres.json();
+    const hv = sres.headers.get("X-Frame-Version");
+    savedVersion = hv != null && /^\d+$/.test(hv) ? parseInt(hv, 10) : null;
+    result = calculateLocal(state); // 先本地铺一版结果，再用服务端结果覆盖
+    const rres = await fetch("/api/result");
+    result = await rres.json();
   } catch (err) {
     alert("无法连接后端计算服务：" + err);
     return;
@@ -2619,6 +2814,7 @@ async function init() {
   renderDoorEditor();
   renderResults();
   markLayerBadges();
+  renderConflictBanner();
   setSaveState("saved", "✓ 就绪 " + new Date().toLocaleTimeString("zh-CN"));
 }
 init();

@@ -1,4 +1,6 @@
 __pycache__/
 *.pyc
 data/state.json
+data/state.meta.json
+data/.state.lock
 .pytest_cache/

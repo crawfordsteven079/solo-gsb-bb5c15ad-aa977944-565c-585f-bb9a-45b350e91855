@@ -22,6 +22,18 @@
   </header>
 
   <main class="layout">
+    <!-- 版本冲突提示：另一页面已保存同一窑车，本页草稿保留待用户处理 -->
+    <div id="conflictBanner" class="conflict-banner" hidden>
+      <div class="conflict-text">
+        <b>⚠ 架体版本冲突</b>
+        <span>本页读取后，架体已在其他页面/标签被保存（服务端最新版本 <b id="conflictVersion">—</b>）。
+        您的未保存编辑仍保留在左侧录入面板中，尚未保存；结果区当前显示服务端最新已保存架体。</span>
+      </div>
+      <div class="conflict-actions">
+        <button id="btnDiscardDraft" class="btn btn-ghost" type="button">放弃我的编辑，载入最新架体</button>
+        <button id="btnForceOverwrite" class="btn btn-confirm" type="button">保留我的编辑并强制覆盖</button>
+      </div>
+    </div>
     <!-- 左：录入面板 -->
     <aside class="editor" id="editor">
       <div class="editor-head">
