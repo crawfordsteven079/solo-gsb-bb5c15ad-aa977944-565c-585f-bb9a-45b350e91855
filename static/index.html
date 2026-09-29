@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>陶瓷窑车层架载荷追踪台</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">🏺</span>
+      <div>
+        <h1>陶瓷窑车层架载荷追踪台</h1>
+        <small>自下而上录入棚板 / 坯件 / 立柱，系统逐层分摊累加载荷</small>
+      </div>
+    </div>
+    <div class="actions">
+      <span id="saveState" class="save-state" title="自动保存状态"></span>
+      <button id="btnReset" class="btn btn-ghost" type="button">↺ 恢复示例</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- 左：录入面板 -->
+    <aside class="editor" id="editor">
+      <div class="editor-head">
+        <h2>架体录入（自下而上）</h2>
+      </div>
+
+      <section class="card car-card">
+        <h3>窑车台面</h3>
+        <div class="grid2">
+          <label>台面宽 W (mm)
+            <input type="number" step="any" data-car="w" />
+          </label>
+          <label>台面深 D (mm)
+            <input type="number" step="any" data-car="d" />
+          </label>
+        </div>
+      </section>
+
+      <div id="layerList"></div>
+
+      <button id="btnAddLayer" class="btn btn-add" type="button">＋ 在顶部增加一层</button>
+      <p class="hint">任意输入变化都会<span class="hl">整架重算</span>并自动保存；坐标原点为台面左下角，单位 mm，重量 kg。</p>
+    </aside>
+
+    <!-- 右：结果区 -->
+    <section class="result">
+      <div class="totals" id="totals"></div>
+
+      <div class="views">
+        <div class="view-box">
+          <div class="view-head">
+            <h2>俯视图（XY 平面，叠加全部层）</h2>
+            <div class="legend">
+              <span><i class="dot normal"></i>正常立柱</span>
+              <span><i class="dot overload"></i>超载</span>
+              <span><i class="dot overlap"></i>落点重叠</span>
+              <span><i class="dot hanging"></i>悬空</span>
+              <span><i class="dot failed"></i>失效（推演）</span>
+              <span id="suggestLegend" class="suggest-legend"><i class="dot suggest"></i>建议新柱（预览）</span>
+              <span id="overturnLegend" class="overturn-legend">
+                <i class="ot-hull-swatch"></i>支撑边界
+                <i class="ot-cg-swatch"></i>整架重心
+                <i class="ot-proj-swatch stable"></i>投影（稳定/临界/倾覆）
+              </span>
+              <span id="wheelLegend" class="wheel-legend">
+                <i class="wh-rect-swatch"></i>轮组矩形
+                <i class="wh-wheel-swatch ok"></i>车轮（反力/超载/负反力）
+              </span>
+            </div>
+          </div>
+          <canvas id="topView"></canvas>
+        </div>
+
+        <div class="view-box">
+          <div class="view-head">
+            <h2>侧视图（分层高度）</h2>
+            <div class="seg">
+              <button class="seg-btn active" data-axis="x" type="button">X–Z 立面</button>
+              <button class="seg-btn" data-axis="y" type="button">Y–Z 立面</button>
+            </div>
+          </div>
+          <canvas id="sideView"></canvas>
+        </div>
+      </div>
+
+      <div class="panel sim-panel">
+        <div class="sim-head">
+          <h2>🔮 立柱失效推演 <span id="simStatus" class="badge">未启用</span></h2>
+          <button id="btnClearSim" class="btn btn-ghost" type="button" disabled>✕ 清空选择 · 恢复基准</button>
+        </div>
+        <p class="hint">
+          勾选下方<b>非悬空</b>立柱作为「失效柱」：系统以当前编辑数据为基准，将其视为不承载后按原规则整架重新分摊，
+          并排对比基准与推演结果。失效标记仅本次会话有效，<span class="hl">不会改写或自动保存</span>架体数据；
+          清空选择立即恢复基准。视图中失效柱为粉色 ⊘（原悬空柱仍为紫色 ✕），点击立柱可查看推演后的载荷来源链。
+        </p>
+        <div id="simPicker" class="sim-picker"></div>
+        <div id="simOutput"></div>
+      </div>
+
+      <div class="panel suggest-panel">
+        <div class="sim-head">
+          <h2>🧱 加柱建议 <span id="suggestStatus" class="badge">未试算</span></h2>
+          <div class="suggest-actions">
+            <button id="btnCancelSuggest" class="btn btn-ghost" type="button" disabled>✕ 取消预览（不改数据）</button>
+            <button id="btnConfirmSuggest" class="btn btn-confirm" type="button" disabled>✓ 确认加柱并保存</button>
+          </div>
+        </div>
+        <p class="hint">
+          选择<b>目标层</b>，设置候选网格间距与新柱容量（0=不限容量，不计利用率），后端仅在该层
+          <b>承托面内</b>、且与现有<b>有效柱</b>距离严格大于 <b id="tolText">10</b> mm（重叠阈值）的网格点上
+          逐点试算新增一根立柱，按「丢失载荷 → 超载数 → 最高利用率 → 坐标」升序返回前 5 个方案。
+          试算<span class="hl">不改动任何数据</span>；点击方案在俯视图预览，确认后才写入架体并自动保存。
+        </p>
+        <div class="suggest-form">
+          <label>目标层
+            <select id="suggestLayer"></select>
+          </label>
+          <label>候选网格间距 (mm)
+            <input type="number" step="any" id="suggestSpacing" value="100" min="1" />
+          </label>
+          <label>新柱容量 (kg，0=不限)
+            <input type="number" step="any" id="suggestCapacity" value="300" min="0" />
+          </label>
+          <button id="btnSuggest" class="btn btn-run" type="button">开始试算</button>
+        </div>
+        <div id="suggestOutput"></div>
+      </div>
+
+      <div class="panel shed-panel">
+        <div class="sim-head">
+          <h2>⚖️ 减载配额试算 <span id="shedStatus" class="badge">未试算</span></h2>
+          <div class="suggest-actions">
+            <button id="btnCancelShed" class="btn btn-ghost" type="button" disabled>✕ 取消试算（不改数据）</button>
+            <button id="btnConfirmShed" class="btn btn-confirm" type="button" disabled>✓ 按建议重量减载并保存</button>
+          </div>
+        </div>
+        <p class="hint">
+          以当前架体为基准，<b>只下调各层坯件重量</b>（棚板/立柱/坐标/容量均不变），在每层减量不超过
+          现有坯件重量的条件下，求让全部<b>有限容量立柱不再超载</b>的<b>最小总减载量</b>。多层坯件载荷
+          会经现有整架分摊规则共同压到下层立柱，求解后按原规则<b>重新整架校验</b>。试算
+          <span class="hl">不写入状态</span>；确认后才把建议坯件重量写入架体并沿用自动保存，
+          一旦继续编辑架体，旧方案立即作废。
+        </p>
+        <div class="suggest-form">
+          <button id="btnShed" class="btn btn-run" type="button">开始减载试算</button>
+        </div>
+        <div id="shedOutput"></div>
+      </div>
+
+      <div class="panel overturn-panel">
+        <div class="sim-head">
+          <h2>📐 层架抗倾覆试算 <span id="overturnStatus" class="badge">未试算</span></h2>
+          <div class="suggest-actions">
+            <button id="btnCancelOverturn" class="btn btn-ghost" type="button" disabled>✕ 清空试算</button>
+            <button id="btnOverturn" class="btn btn-run" type="button">开始抗倾覆试算</button>
+          </div>
+        </div>
+        <p class="hint">
+          沿用当前编辑的架体：以<b>各层累计高度</b>作为该层棚板与坯件的重心高度、<b>棚板中心</b>
+          作为两者水平重心，按重量求<b>整架重心</b>；取<b>底层非悬空立柱落点的凸包</b>作为支撑多边形。
+          输入水平加速度 x/y 分量（单位 <b>g</b>），重心投影按「加速度 × 重心高度」平移后，计算投影点
+          到支撑边界的<b>带符号最短距离</b>：<b style="color:var(--normal)">正=稳定</b>、
+          <b style="color:var(--warn)">0=临界</b>、<b style="color:var(--error)">负=倾覆</b>。
+          结果同步叠加在俯视图（支撑边界 + 重心/投影点）。试算<span class="hl">只读不写盘</span>；
+          落点不足以形成非零面积、或任一层无有效承托时明确返回无法评估；<b>编辑架体后旧试算立即失效</b>。
+        </p>
+        <div class="overturn-form">
+          <label>水平加速度 ax (g)
+            <input type="number" step="any" id="overturnAx" value="0.1" />
+          </label>
+          <label>水平加速度 ay (g)
+            <input type="number" step="any" id="overturnAy" value="0" />
+          </label>
+        </div>
+        <div id="overturnOutput"></div>
+      </div>
+
+      <div class="panel seq-panel">
+        <div class="sim-head">
+          <h2>🚚 逐层装货顺序规划 <span id="seqStatus" class="badge">未规划</span></h2>
+          <div class="suggest-actions">
+            <button id="btnCancelSeq" class="btn btn-ghost" type="button" disabled>✕ 清空规划</button>
+            <button id="btnSeq" class="btn btn-run" type="button">开始装货顺序规划</button>
+          </div>
+        </div>
+        <p class="hint">
+          以<b>当前架体</b>为准、<b>保留全部棚板自重</b>：先把所有层坯件重量置零，再把
+          <b>坯件重量大于零的层（至多 12 层）</b>按<b>整层坯件一次加入</b>模拟装货，
+          对每个已装子集用与抗倾覆试算相同的模型计算<b>带符号裕量</b>，并用动态规划找出
+          「<b>全过程最小裕量最大</b>」的加入顺序（同分按<b>层序号字典序</b>自下而上选取）。
+          输入水平加速度 x/y 分量（单位 <b>g</b>）。面板逐步列出新增层、累计坯件重量、裕量与
+          稳定判定；若<b>最优顺序仍有非正裕量</b>，会标明无法全程稳定。规划<span class="hl">只读不写盘</span>；
+          无有效承托、底层支撑凸包退化或初始棚板总重为零时无法规划，候选层超过 12 层会提示缩减范围；
+          <b>编辑架体后旧结果立即作废</b>。
+        </p>
+        <div class="overturn-form seq-form">
+          <label>水平加速度 ax (g)
+            <input type="number" step="any" id="seqAx" value="0.1" />
+          </label>
+          <label>水平加速度 ay (g)
+            <input type="number" step="any" id="seqAy" value="0" />
+          </label>
+        </div>
+        <div id="seqOutput"></div>
+      </div>
+
+      <div class="panel door-panel">
+        <div class="sim-head">
+          <h2>🚪 连续窑门通行试算 <span id="doorStatus" class="badge">未试算</span></h2>
+          <div class="suggest-actions">
+            <button id="btnCancelDoor" class="btn btn-ghost" type="button" disabled>✕ 清空试算</button>
+            <button id="btnDoor" class="btn btn-run" type="button">开始通行试算</button>
+          </div>
+        </div>
+        <p class="hint">
+          按<b>行进顺序</b>录入每道窑门的<b>开口横向中心、宽度、高度</b>以及进入该门前<b>本段最大横移量</b>
+          （单位均为 mm），首门从横移 <b>0</b> 出发。后端由<b>窑车台面与各层棚板</b>求横向外廓、
+          <b>累加层高</b>求最高点；逐门给出可通过的横移<b>闭区间</b>（<b>高度不足直接阻断</b>），
+          再按门序把上一可达区间按本段横移量<b>扩张</b>后与本门区间<b>求交</b>——
+          <b>首次交集为空即在该门阻断</b>（即使各门单独能过）。全程可达时回溯一条满足各段横移限制的
+          <b>位置序列</b>，逐门列出<b>左 / 右 / 顶部净空</b>。试算只读取当前架体、<span class="hl">不写盘</span>；
+          <b>架体或门参数改变后旧结果立即失效</b>。
+        </p>
+        <div class="door-editor-head">
+          <span>窑门序列（自上而下为行进顺序）</span>
+          <button id="btnAddDoor" class="btn-add-post" type="button" style="width:auto;padding:2px 10px">＋ 增加一道门</button>
+        </div>
+        <div id="doorList"></div>
+        <div id="doorOutput"></div>
+      </div>
+
+      <div class="panel wheel-panel">
+        <div class="sim-head">
+          <h2>🛞 轮组承载试算 <span id="wheelStatus" class="badge">未试算</span></h2>
+          <div class="suggest-actions">
+            <button id="btnCancelWheel" class="btn btn-ghost" type="button" disabled>✕ 清空试算</button>
+            <button id="btnWheel" class="btn btn-run" type="button">开始轮组试算</button>
+          </div>
+        </div>
+        <p class="hint">
+          台面由<b>矩形布置的四个车轮</b>承托：填写台面内的<b>左 / 右轮位 X 坐标</b>与
+          <b>前 / 后轮位 Y 坐标</b>（mm）及<b>四轮额定载荷</b>（kg）。后端以<b>底层非悬空立柱</b>
+          的落点与实载为点载荷，按双向杠杆（双线性）比例把载荷分到四轮：<b>落点越出轮组矩形时
+          允许外推，负反力不截零</b>（否则力与力矩不平衡）。页面给出逐轮反力、利用率、超载与
+          负反力风险，并核对<b>反力之和与绕 X/Y 轴力矩</b>是否与点载荷一致。试算
+          <span class="hl">只读不写盘</span>；<b>编辑架体后旧结果立即失效</b>。
+        </p>
+        <div class="wheel-form">
+          <div class="wheel-coords">
+            <label>左轮位 X xLeft (mm)
+              <input type="number" step="any" id="wheelXLeft" value="150" />
+            </label>
+            <label>右轮位 X xRight (mm)
+              <input type="number" step="any" id="wheelXRight" value="1150" />
+            </label>
+            <label>前轮位 Y yFront (mm)
+              <input type="number" step="any" id="wheelYFront" value="150" />
+            </label>
+            <label>后轮位 Y yRear (mm)
+              <input type="number" step="any" id="wheelYRear" value="750" />
+            </label>
+          </div>
+          <div class="wheel-ratings">
+            <label>左前 FL 额定 (kg)
+              <input type="number" step="any" id="wheelRatedFL" value="500" min="0" />
+            </label>
+            <label>右前 FR 额定 (kg)
+              <input type="number" step="any" id="wheelRatedFR" value="500" min="0" />
+            </label>
+            <label>左后 RL 额定 (kg)
+              <input type="number" step="any" id="wheelRatedRL" value="500" min="0" />
+            </label>
+            <label>右后 RR 额定 (kg)
+              <input type="number" step="any" id="wheelRatedRR" value="500" min="0" />
+            </label>
+          </div>
+        </div>
+        <div id="wheelOutput"></div>
+      </div>
+
+      <div class="bottom-grid">
+        <div class="panel issues-panel">
+          <h2>告警与判定 <span id="issueCount" class="badge"></span></h2>
+          <ul id="issueList"></ul>
+        </div>
+        <div class="panel detail-panel">
+          <h2 id="detailTitle">载荷来源明细</h2>
+          <div id="detailBody"><p class="muted">点击俯视图/侧视图中的立柱或棚板，查看其载荷来源链。</p></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
