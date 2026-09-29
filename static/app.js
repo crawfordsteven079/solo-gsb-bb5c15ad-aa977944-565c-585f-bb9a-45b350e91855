@@ -1,14 +1,18 @@
 /* 陶瓷窑车层架载荷追踪台 —— 原生 JS 前端
- * 编辑重算走 PUT /api/state（自动保存）；立柱失效推演走 POST /api/simulate（只算不存）。
- * 输入变化防抖触发，结果整架同步刷新；后端不可用时用浏览器内同一套算法兜底。
+ * 编辑重算走 PUT /api/state（自动保存），保存携带读取时的 X-Rack-Version 版本头
+ * 做乐观并发控制：同页保存串行合并、跨页冲突（409）保留未保存草稿并提示；
+ * 立柱失效推演走 POST /api/simulate（只算不存）。
+ * 输入变化防抖触发，结果整架同步刷新；后端不可用时用浏览器内同一套算法兜底
+ * （但兜底只代表本地重算，绝不代表已保存）。
  */
 "use strict";
 
 const TOL_MM = 10;
 const LAYER_COLORS = ["#4f9dff", "#34c08a", "#c08bff", "#f0b03c", "#ef5b6b", "#3fd6d6"];
 
-let state = null;        // 输入架体（可编辑）
-let result = null;       // 后端计算结果（基准）
+let state = null;        // 输入架体（可编辑，可能含未保存的本地草稿）
+let result = null;       // 后端计算结果（基准；冲突后为本地草稿的只读重算）
+let savedVersion = null; // 最近一次已知的服务端架体版本（GET / PUT成功 / reset 后更新）
 let simulation = null;   // 失效推演结果（非 null 时视图/明细展示推演值）
 let simDiff = null;      // 基准 vs 推演差异（台面载荷/丢失载荷/逐柱差值/新增问题）
 let failedSelection = []; // 失效柱选择 [{layer, post}]，仅会话内有效，不保存
@@ -18,6 +22,25 @@ let sideAxis = "x";
 let recalcTimer = null;
 const topHit = [];       // 俯视图可点击热区
 const sideHit = [];      // 侧视图可点击热区
+
+/* ================= 保存队列与版本冲突（多页面并发编辑） =================
+ * 同一窑车可能在多个页面/标签同时编辑：PUT /api/state 必须携带读取时的
+ * 架体版本（X-Rack-Version 头），服务端核对版本通过才提交并返回新版本。
+ *
+ * - saveChain：保存严格串行化。同页连续编辑只允许一个 PUT 在途，期间的
+ *   新草稿合并进 pending（携带上一次成功返回的版本），避免同页自己与
+ *   自己冲突；每个入队请求都挂到最终一次写入的 Promise 上。
+ * - saveEpoch：页面本地保存代次。reset 成功后 +1，使重置前已发出、尚未
+ *   返回的保存响应一律作废——较早请求的响应不得覆盖较新草稿/重置状态。
+ * - conflictInfo：版本冲突（409）时保存服务端返回的最新架体与版本。
+ *   未保存编辑原样保留在编辑器里，绝不显示“已保存”，也不用本地试算
+ *   伪装成保存成功；只读 POST /api/recalc 仍可对本地草稿重算供查看。
+ */
+let saveInFlight = false;
+let savePending = null;  // {payload, applyChange, force, tick, waiters:[{resolve,reject}]}
+let saveEpoch = 0;       // reset 成功后 +1：使重置前发出的保存响应整体作废
+let saveTick = 0;        // 入队单调序号：较早请求的响应不得覆盖较新草稿
+let conflictInfo = null; // {version, state, result}
 
 /* ================= 加柱建议状态 =================
  * suggestData 只来自 POST /api/suggest 的试算结果（或离线兜底），绝不写盘；
@@ -133,13 +156,10 @@ function collectState() {
   return state;
 }
 
-/* ================= 重算 + 保存 + 渲染 ================= */
-async function recalcAndRender(applyChange) {
-  const payload = collectState();
-  let label = "重算并保存中…";
-  if (applyChange === "suggest") label = "写入新柱并保存中…";
-  if (applyChange === "shed") label = "写入建议坯件重量并保存中…";
-  setSaveState("saving", label);
+/* ================= 重算 + 保存（版本化） + 渲染 ================= */
+
+/* 编辑后统一作废依赖已保存架体的只读试算（确认写入的那次除外） */
+function invalidateDependentTrials(applyChange) {
   // 架体一经编辑/写盘，之前的加柱试算与减载试算结果即作废（确认写入的那次除外）
   if (!applyChange) {
     invalidateSuggestions({ silent: true });
@@ -155,31 +175,254 @@ async function recalcAndRender(applyChange) {
   invalidateWheelTrial({ silent: true });
   suggestAppliedMsg = null;
   if (applyChange !== "shed") shedAppliedMsg = null;
+}
+
+async function recalcAndRender(applyChange) {
+  const payload = collectState();
+  invalidateDependentTrials(applyChange);
+
+  // 已处于版本冲突（保存被服务端拒绝）状态：
+  // 后续编辑只更新本地草稿并走只读重算，绝不自动重试保存、绝不显示“已保存”，
+  // 也不用本地试算掩盖未保存事实。用户须在冲突横幅上显式选择如何解决。
+  if (conflictInfo) {
+    setSaveState(
+      "conflict",
+      "⚠ 版本冲突未解决：编辑仅保留在本页，未保存（v" + savedVersion + "）"
+    );
+    await runDraftRecalc(payload, applyChange);
+    return "conflict";
+  }
+
+  return enqueueSave(payload, applyChange, false);
+}
+
+/* 把一次保存并入串行队列；返回的 Promise 在其对应（或更新一次）写入落定后兑现 */
+function enqueueSave(payload, applyChange, force) {
+  return new Promise((resolve, reject) => {
+    saveTick += 1;
+    if (savePending) {
+      // 已有在途保存：原地更新为最新草稿。较早草稿的保存响应到达时将被 tick 判废，
+      // 不会覆盖较新草稿；本次调用挂在同一作业上一起等待最终结果。
+      savePending.payload = payload;
+      savePending.applyChange = applyChange;
+      savePending.force = force || savePending.force;
+      savePending.tick = saveTick;
+      savePending.waiters.push({ resolve, reject });
+    } else {
+      savePending = {
+        payload,
+        applyChange,
+        force,
+        tick: saveTick,
+        waiters: [{ resolve, reject }],
+      };
+    }
+    pumpSaveQueue();
+  });
+}
+
+async function pumpSaveQueue() {
+  if (saveInFlight || !savePending) return;
+  saveInFlight = true;
+  while (savePending) {
+    const job = savePending; // 在途期间该对象会被原地更新为更新草稿，或被 reset 清空
+    const payload = job.payload;
+    const applyChange = job.applyChange;
+    const force = job.force;
+    const epoch = saveEpoch;
+    const tick = job.tick;
+    const label =
+      applyChange === "suggest" ? "写入新柱并保存中…"
+      : applyChange === "shed" ? "写入建议坯件重量并保存中…"
+      : "重算并保存中…";
+    setSaveState("saving", label);
+    // eslint-disable-next-line no-await-in-loop
+    const outcome = await doSave(payload, applyChange, force, epoch, tick);
+
+    if (saveEpoch !== epoch) {
+      // reset 已在途中发生：队列已被清空，唤醒仍挂起的等待方后退出
+      job.waiters.forEach((w) => w.resolve("stale"));
+      break;
+    }
+    if (outcome === "stale" && savePending === job && savePending.tick !== tick) {
+      // 在途期间本作业已被更新草稿取代：版本号已在 doSave 内吸收，
+      // 等待方继续挂到本作业的最终一次写入上，本次不唤醒、不清队列。
+      continue;
+    }
+
+    // 作业最终落定（saved/conflict/error，或无后续草稿）：唤醒全部等待方
+    job.waiters.forEach((w) => w.resolve(outcome));
+    if (outcome === "conflict") {
+      savePending = null;                  // 冲突后停止自动保存；后续编辑只走只读重算
+      break;
+    }
+    if (savePending === job) savePending = null; // 在途期间没有更新草稿：队列处理完
+    // 若 savePending 已被换成新对象（极端情况下在 await 间隙入队），循环继续处理它。
+  }
+  saveInFlight = false;
+}
+
+/* 执行一次 PUT。返回 "saved" | "conflict" | "error" | "stale"。
+ * tick 落后于最新草稿时为过期响应：不覆盖较新草稿/视图；
+ * 但成功返回的新版本号仍要记下，供排在后面的最新草稿请求使用。 */
+async function doSave(payload, applyChange, force, epoch, tick) {
+  let outcome;
   try {
+    const headers = { "Content-Type": "application/json" };
+    // force=true 时故意不带版本头：走无版本旧语义强制覆盖（用户在冲突后显式选择）
+    if (!force && Number.isInteger(savedVersion)) {
+      headers["X-Rack-Version"] = String(savedVersion);
+    }
     const res = await fetch("/api/state", {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify(payload),
     });
-    if (!res.ok) throw new Error("保存失败");
-    const data = await res.json();
-    result = data.result;
-    state = payload;
-    setSaveState("saved", "✓ 已重算并保存 " + new Date().toLocaleTimeString("zh-CN"));
-    if (applyChange === "suggest") suggestAppliedMsg = "✓ 新柱已写入架体并触发自动保存";
-    if (applyChange === "shed") shedAppliedMsg = "✓ 建议坯件重量已写入架体并触发自动保存";
+    const data = await res.json().catch(() => null);
+
+    // reset 已推进代次：重置前发出的保存响应（无论结果）一律丢弃，不得覆盖重置
+    if (epoch !== saveEpoch) return "stale";
+    // 在途期间本页又产生了更新草稿（无论合并进本作业还是已生成下一作业）：
+    // 本响应属于较早请求，不得覆盖较新草稿。成功提交的版本号仍要吸收
+    //（最新草稿的下一次 PUT 必须基于它），然后静默退出。
+    if (saveTick !== tick) {
+      // 2xx 成功才吸收版本；409/其它错误不改变本地版本（仍由冲突流程处理）
+      if (res.ok && data) savedVersion = extractVersion(res, data);
+      return "stale";
+    }
+
+    if (res.status === 409 && data && data.conflict) {
+      // 版本冲突：服务端拒绝了旧写入。保留本地未保存编辑，记录最新已保存架体。
+      conflictInfo = {
+        version: data.version,
+        state: data.state,
+        result: data.result,
+      };
+      savedVersion = data.version; // 之后若强制覆盖，无需再带版本头
+      state = payload;             // 编辑器内容就是用户的未保存草稿，原样保留
+      // 结果区按本地草稿只读重算（不写盘），保证视图与左侧未保存编辑一致；
+      // 绝不显示“已保存”。服务端最新架体留在 conflictInfo.state，供“放弃”时载入。
+      simulation = null; simDiff = null;
+      setSaveState("conflict", "⚠ 保存被拒：版本冲突，本页编辑未保存（服务端最新 v" + data.version + "）");
+      renderConflictBanner();
+      await runDraftRecalc(payload, applyChange);
+      outcome = "conflict";
+    } else if (!res.ok || !data) {
+      throw new Error("保存失败");
+    } else {
+      conflictInfo = null;
+      savedVersion = extractVersion(res, data);
+      result = data.result;
+      state = payload;
+      setSaveState("saved", "✓ 已重算并保存 " + new Date().toLocaleTimeString("zh-CN"));
+      if (applyChange === "suggest") suggestAppliedMsg = "✓ 新柱已写入架体并触发自动保存";
+      if (applyChange === "shed") shedAppliedMsg = "✓ 建议坯件重量已写入架体并触发自动保存";
+      renderConflictBanner();
+      outcome = "saved";
+    }
   } catch (err) {
-    setSaveState("error", "保存失败，仅本地重算");
+    // 网络/服务不可用（不是版本冲突）：才允许本地兜底重算，并明确标注未能保存
+    if (epoch !== saveEpoch) return "stale";
+    if (saveTick !== tick) return "stale";
+    setSaveState("error", "保存失败，仅本地重算（未保存到服务端）");
     result = calculateLocal(payload);
+    state = payload;
     if (applyChange === "suggest") suggestAppliedMsg = "✓ 新柱已加入本地编辑（后端不可用，未能保存）";
     if (applyChange === "shed") shedAppliedMsg = "✓ 建议坯件重量已加入本地编辑（后端不可用，未能保存）";
+    outcome = "error";
   }
   selection = selection && stillExists(selection) ? selection : null;
   // 编辑只更新基准；若正在推演，用同一失效选择在新基准上重跑（失效标记不保存）
+  if (outcome === "saved" || outcome === "error") {
+    if (failedSelection.length) await refreshSimulation();
+    else { simulation = null; simDiff = null; }
+  }
+  renderResults();
+  markLayerBadges();
+  return outcome;
+}
+
+/* 冲突未解决期间继续编辑：只读重算本地草稿（POST /api/recalc 不写盘、不递增版本），
+ * 结果仅用于查看，顶栏始终保留“未保存/冲突”状态。 */
+async function runDraftRecalc(payload, applyChange) {
+  state = payload;
+  try {
+    const res = await fetch("/api/recalc", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw new Error("recalc failed");
+    result = await res.json();
+  } catch (e) {
+    result = calculateLocal(payload);
+  }
+  selection = selection && stillExists(selection) ? selection : null;
   if (failedSelection.length) await refreshSimulation();
   else { simulation = null; simDiff = null; }
   renderResults();
   markLayerBadges();
+}
+
+function extractVersion(res, data) {
+  const hv = parseInt(res.headers.get("X-Rack-Version"), 10);
+  if (Number.isInteger(hv) && hv > 0) return hv;
+  if (data && Number.isInteger(data.version) && data.version > 0) return data.version;
+  return savedVersion;
+}
+
+/* ================= 版本冲突横幅 ================= */
+function renderConflictBanner() {
+  const box = $("#conflictBanner");
+  if (!box) return;
+  if (!conflictInfo) { box.hidden = true; box.innerHTML = ""; return; }
+  box.hidden = false;
+  box.innerHTML = `
+    <div class="cb-title">⚠ 检测到版本冲突：本页编辑未保存</div>
+    <div>
+      架体已被<b>其他页面</b>（或「恢复示例」）更新到 <b>v${conflictInfo.version}</b>。
+      您读取时基于的是旧版本，服务端已拒绝本次写入，<b>左侧编辑器中的未保存修改已原样保留</b>，
+      结果区按您的本地草稿只读重算（<b>未落盘</b>）。请选择如何处理：
+    </div>
+    <div class="cb-actions">
+      <button id="cbDiscard" class="btn btn-cb-discard" type="button">放弃本页修改，载入最新架体</button>
+      <button id="cbForce" class="btn btn-cb-force" type="button">以本页编辑强制覆盖保存（忽略版本）</button>
+      <button id="cbKeep" class="btn btn-cb-keep" type="button">先保留修改，我再看看</button>
+    </div>`;
+  $("#cbDiscard").addEventListener("click", resolveConflictDiscard);
+  $("#cbForce").addEventListener("click", resolveConflictForce);
+  $("#cbKeep").addEventListener("click", () => {
+    $("#conflictBanner").hidden = true; // 顶栏的冲突/未保存状态仍保留
+  });
+}
+
+/* 放弃本地未保存编辑，载入服务端最新已保存架体 */
+async function resolveConflictDiscard() {
+  if (!conflictInfo) return;
+  const latest = conflictInfo.state;
+  const latestResult = conflictInfo.result;
+  const version = conflictInfo.version;
+  conflictInfo = null;
+  state = latest;
+  result = latestResult;
+  savedVersion = version;
+  selection = null;
+  failedSelection = []; simulation = null; simDiff = null; simSeq++;
+  renderEditor();
+  renderConflictBanner();
+  setSaveState("saved", "✓ 已载入最新架体 v" + version + " " + new Date().toLocaleTimeString("zh-CN"));
+  renderResults();
+  markLayerBadges();
+}
+
+/* 保留本地编辑并强制覆盖：走无版本 PUT（旧语义），服务端仍会生成新版本 */
+async function resolveConflictForce() {
+  if (!conflictInfo) return;
+  const payload = collectState(); // 以编辑器中保留的未保存草稿为准
+  setSaveState("saving", "强制覆盖保存中…");
+  conflictInfo = null;
+  renderConflictBanner();
+  await enqueueSave(payload, null, true);
 }
 
 /* ================= 立柱失效推演 =================
@@ -402,9 +645,22 @@ $("#btnAddLayer").addEventListener("click", () => {
 
 $("#btnReset").addEventListener("click", async () => {
   if (!confirm("恢复为内置示例数据？当前编辑将被覆盖。")) return;
-  const res = await fetch("/api/reset", { method: "POST" });
-  const data = await res.json();
-  state = data.state; result = data.result;
+  let data;
+  try {
+    const res = await fetch("/api/reset", { method: "POST" });
+    data = await res.json();
+    if (!res.ok || !data || !data.state) throw new Error("reset failed");
+  } catch (e) {
+    alert("恢复示例失败：无法连接后端服务，本地编辑保持不变。");
+    return;
+  }
+  // 重置生成新版本：使重置前已发出、尚未返回的保存响应整体作废（旧响应不得覆盖重置）
+  saveEpoch++;
+  savePending = null;
+  conflictInfo = null;
+  state = data.state;
+  result = data.result;
+  savedVersion = Number.isInteger(data.version) ? data.version : savedVersion;
   selection = null;
   failedSelection = []; simulation = null; simDiff = null; simSeq++;
   invalidateSuggestions({ silent: true });
@@ -415,8 +671,10 @@ $("#btnReset").addEventListener("click", async () => {
   invalidateWheelTrial({ silent: true });
   suggestAppliedMsg = null;
   shedAppliedMsg = null;
-  renderEditor(); renderResults(); markLayerBadges();
-  setSaveState("saved", "✓ 已恢复示例 " + new Date().toLocaleTimeString("zh-CN"));
+  renderEditor();
+  renderConflictBanner();
+  renderResults(); markLayerBadges();
+  setSaveState("saved", "✓ 已恢复示例（v" + savedVersion + "）" + new Date().toLocaleTimeString("zh-CN"));
 });
 
 /* 侧视图切换 */
@@ -2611,15 +2869,19 @@ async function init() {
     result = r;
     const sres = await fetch("/api/state");
     state = await sres.json();
+    // 读取时携带架体版本：此后所有保存都基于该版本做乐观并发控制
+    const hv = parseInt(sres.headers.get("X-Rack-Version"), 10);
+    savedVersion = Number.isInteger(hv) && hv > 0 ? hv : null;
   } catch (err) {
     alert("无法连接后端计算服务：" + err);
     return;
   }
   renderEditor();
   renderDoorEditor();
+  renderConflictBanner();
   renderResults();
   markLayerBadges();
-  setSaveState("saved", "✓ 就绪 " + new Date().toLocaleTimeString("zh-CN"));
+  setSaveState("saved", "✓ 就绪（v" + savedVersion + "）" + new Date().toLocaleTimeString("zh-CN"));
 }
 init();
 

@@ -3,10 +3,18 @@
 
 接口
 ----
-GET  /api/state      读取当前架体（输入），首次启动自动载入示例数据
-PUT  /api/state      保存编辑后的架体（JSON body）
+GET  /api/state      读取当前架体（输入），首次启动自动载入示例数据；
+                     响应头 X-Rack-Version 返回当前架体版本（整数，从 1 起单调递增）
+PUT  /api/state      保存编辑后的架体（JSON body，结构与读取完全一致）。
+                     建议携带读取时的 X-Rack-Version 请求头：服务端在一次原子写入中
+                     核对版本——版本匹配才提交并把版本 +1；不匹配返回 409，
+                     body 含 {"conflict": true, "version": 最新版本,
+                     "state": 最新已保存架体, "result": 最新架体重算结果}，
+                     原架体不变。不带 X-Rack-Version 头仍按旧语义直接覆盖保存，
+                     但版本同样 +1（可用于用户在冲突提示后选择强制覆盖）。
+                     成功响应（及 409 响应）均带 X-Rack-Version 头
 POST /api/recalc     对给定（或当前持久化）架体重算，返回完整结果
-GET  /api/result     直接返回当前持久化架体的重算结果
+GET  /api/result     直接返回当前持久化架体的重算结果（响应头带 X-Rack-Version）
 POST /api/simulate   立柱失效推演：body {"state": 架体JSON(可省), "failed": [{"layer": 0, "post": "P1"}]}，
                      返回基准/推演/差值；只计算，不写盘、不保存失效标记
 POST /api/suggest    加柱建议：body {"state"(可省), "layer": 0, "spacing": 200, "capacity": 300}，
@@ -35,7 +43,9 @@ POST /api/door-passage
                      扩张本段横移量后与本门区间求交，首次交集为空即阻断并给出冲突；
                      全程可达时回溯一条位置序列与逐门左/右/顶部净空；
                      只计算，不写盘；架体没有层时返回 evaluable=false，门参数非法返回 400
-POST /api/reset      恢复内置示例数据
+POST /api/reset      恢复内置示例数据，并把架体版本 +1（生成新版本）：
+                     重置前发出的旧版本保存即使后到也会因版本不符被拒绝，
+                     不能事后覆盖重置结果；响应同样带 X-Rack-Version 头
 POST /api/wheel-load 轮组承载试算：body {"state"(可省), "xLeft","xRight","yFront",
                      "yRear"(台面内四轮坐标 mm), "ratedFL/FR/RL/RR"(四轮额定载荷 kg)}
                      ——以底层非悬空立柱的落点与实载为点载荷，按矩形四轮的双向杠杆
@@ -50,6 +60,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 
 from flask import Flask, jsonify, request, send_from_directory
 
@@ -72,6 +83,16 @@ DATA_DIR = os.environ.get(
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
 SAMPLE_FILE = os.path.join(DATA_DIR, "sample_state.json")
 
+# 架体版本相关常量：
+#   VERSION_HEADER   读/写/重置接口传递版本号的 HTTP 头
+#   INITIAL_VERSION  首次初始化（含旧格式文件迁移）使用的版本号
+VERSION_HEADER = "X-Rack-Version"
+INITIAL_VERSION = 1
+
+# 单 worker 下的进程内串行锁：把「读盘 → 核对版本 → 写盘」放进同一临界区，
+# 保证一次写入操作内核对版本与保存完整架体是原子的。
+_state_lock = threading.Lock()
+
 app = Flask(__name__, static_folder=None)
 
 
@@ -92,10 +113,90 @@ def _atomic_write_json(path: str, payload) -> None:
             os.remove(tmp)
 
 
-def load_state():
+def load_record():
+    """读取持久化记录，返回 (架体dict, 版本int)。
+
+    文件缺失时由内置示例初始化；旧格式裸架体在首次读取时就地迁移为
+    {"version": 1, "state": 架体}（原子写回），架体内容不变。
+    """
     if not os.path.exists(STATE_FILE):
-        _atomic_write_json(STATE_FILE, _read_json(SAMPLE_FILE))
-    return _read_json(STATE_FILE)
+        _atomic_write_json(
+            STATE_FILE,
+            {"version": INITIAL_VERSION, "state": _read_json(SAMPLE_FILE)},
+        )
+    raw = _read_json(STATE_FILE)
+    version = raw.get("version") if isinstance(raw, dict) else None
+    if (
+        isinstance(raw, dict)
+        and isinstance(raw.get("state"), dict)
+        and isinstance(version, int)
+        and not isinstance(version, bool)
+        and version >= 1
+    ):
+        return raw["state"], version
+    # 形如包装但 version 损坏（非正整数等）：不静默错迁，避免把 {"state": ...} 当裸架体嵌套
+    if isinstance(raw, dict) and isinstance(raw.get("state"), dict):
+        raise ValueError(
+            f"状态文件 {STATE_FILE} 的 version 字段损坏（应为正整数），请修复或删除后重启"
+        )
+    # 旧格式（裸架体 JSON）：迁移为带版本包装，版本从 1 起
+    _atomic_write_json(STATE_FILE, {"version": INITIAL_VERSION, "state": raw})
+    return raw, INITIAL_VERSION
+
+
+def load_state():
+    """只取当前持久化架体（保持各处调用签名不变）。"""
+    return load_record()[0]
+
+
+def _commit_state(expected_version, state_body):
+    """在临界区内完成「读盘 → 核对版本 → 写完整架体 → 版本 +1」。
+
+    expected_version 为 None 表示无版本写入（旧调用语义）：不核对版本，
+    无论当前版本是多少都提交，但版本依旧在当前值上 +1。
+
+    返回 (ok, current_version, current_state)：
+      ok=True  → 已提交，current_version 为新版本；
+      ok=False → 版本冲突，current_state 为未被改动的最新已保存架体。
+    """
+    with _state_lock:
+        current_state, current_version = load_record()
+        if (
+            expected_version is not None
+            and expected_version != current_version
+        ):
+            return False, current_version, current_state
+        new_version = current_version + 1
+        _atomic_write_json(
+            STATE_FILE, {"version": new_version, "state": state_body}
+        )
+        return True, new_version, state_body
+
+
+def _parse_version_header():
+    """解析 PUT 请求携带的 X-Rack-Version 头。
+
+    返回 (version, error_response)：
+      头缺失/空白 → (None, None)，按无版本旧语义处理；
+      非正整数    → (None, 400响应)；
+      合法正整数  → (version, None)。
+    """
+    raw = request.headers.get(VERSION_HEADER)
+    if raw is None or not str(raw).strip():
+        return None, None
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None, (
+            jsonify({"error": f"{VERSION_HEADER} 必须是正整数版本号"}),
+            400,
+        )
+    if value <= 0:
+        return None, (
+            jsonify({"error": f"{VERSION_HEADER} 必须是正整数版本号"}),
+            400,
+        )
+    return value, None
 
 
 def ensure_initialized() -> None:
@@ -103,9 +204,16 @@ def ensure_initialized() -> None:
 
     依赖已在镜像构建时装好；这里保证服务一旦启动，data/state.json
     即存在且可读写，无需等待首次请求。
+
+    已存在的文件（含升级前的旧格式裸架体）不在此处改写；旧格式的版本
+    包装迁移在首次读取/写入时由 load_record() 惰性、原子地完成，避免
+    import 本模块就产生磁盘副作用。
     """
     if not os.path.exists(STATE_FILE):
-        _atomic_write_json(STATE_FILE, _read_json(SAMPLE_FILE))
+        _atomic_write_json(
+            STATE_FILE,
+            {"version": INITIAL_VERSION, "state": _read_json(SAMPLE_FILE)},
+        )
 
 
 ensure_initialized()
@@ -123,7 +231,10 @@ def static_files(filename):
 
 @app.route("/api/state", methods=["GET"])
 def api_get_state():
-    return jsonify(load_state())
+    state_body, version = load_record()
+    resp = jsonify(state_body)
+    resp.headers[VERSION_HEADER] = str(version)
+    return resp
 
 
 @app.route("/api/state", methods=["PUT"])
@@ -131,8 +242,31 @@ def api_put_state():
     payload = request.get_json(force=True, silent=True)
     if not isinstance(payload, dict):
         return jsonify({"error": "请求体必须是 JSON 对象"}), 400
-    _atomic_write_json(STATE_FILE, payload)
-    return jsonify({"ok": True, "result": calculate(payload)})
+    expected, err = _parse_version_header()
+    if err is not None:
+        return err
+    committed, version, current = _commit_state(expected, payload)
+    if not committed:
+        # 版本冲突：拒绝旧写入，返回最新已保存架体及其版本，磁盘内容不变
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "conflict": True,
+                    "error": "架体已被其他页面或重置操作更新：版本冲突，本次保存未写入",
+                    "version": version,
+                    "state": current,
+                    "result": calculate(current),
+                }
+            ),
+            409,
+            {VERSION_HEADER: str(version)},
+        )
+    return (
+        jsonify({"ok": True, "version": version, "result": calculate(payload)}),
+        200,
+        {VERSION_HEADER: str(version)},
+    )
 
 
 @app.route("/api/recalc", methods=["POST"])
@@ -144,7 +278,10 @@ def api_recalc():
 
 @app.route("/api/result", methods=["GET"])
 def api_result():
-    return jsonify(calculate(load_state()))
+    state_body, version = load_record()
+    resp = jsonify(calculate(state_body))
+    resp.headers[VERSION_HEADER] = str(version)
+    return resp
 
 
 @app.route("/api/simulate", methods=["POST"])
@@ -164,8 +301,26 @@ def api_simulate():
 @app.route("/api/reset", methods=["POST"])
 def api_reset():
     sample = _read_json(SAMPLE_FILE)
-    _atomic_write_json(STATE_FILE, sample)
-    return jsonify({"ok": True, "state": sample, "result": calculate(sample)})
+    # 重置同样生成新版本号（在当前版本上 +1），使重置前发出的旧版本保存
+    # 即使后到也会因版本不符被拒绝，不能事后覆盖重置后的示例架体。
+    with _state_lock:
+        _, current_version = load_record()
+        new_version = current_version + 1
+        _atomic_write_json(
+            STATE_FILE, {"version": new_version, "state": sample}
+        )
+    return (
+        jsonify(
+            {
+                "ok": True,
+                "version": new_version,
+                "state": sample,
+                "result": calculate(sample),
+            }
+        ),
+        200,
+        {VERSION_HEADER: str(new_version)},
+    )
 
 
 @app.route("/api/wheel-load", methods=["POST"])

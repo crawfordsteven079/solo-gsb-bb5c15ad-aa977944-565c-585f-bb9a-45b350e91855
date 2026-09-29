@@ -44,6 +44,26 @@ body {
 .save-state.saved { color: var(--normal); }
 .save-state.saving { color: var(--warn); }
 .save-state.error { color: var(--error); }
+.save-state.conflict { color: var(--error); font-weight: 600; }
+
+/* ---------- 多页面编辑版本冲突横幅 ---------- */
+.conflict-banner {
+  border: 1px solid var(--error);
+  background: rgba(239, 91, 107, 0.12);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  font-size: 12px;
+  line-height: 1.7;
+}
+.conflict-banner[hidden] { display: none; }
+.conflict-banner .cb-title { color: var(--error); font-weight: 700; }
+.conflict-banner .cb-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.conflict-banner .btn { padding: 4px 10px; font-size: 12px; }
+.btn-cb-discard { background: var(--accent); color: #fff; border: none; }
+.btn-cb-force { background: var(--warn); color: #1a1a1a; border: none; }
+.btn-cb-keep { background: transparent; color: var(--muted); border: 1px solid var(--line); }
 
 /* ---------- 布局 ---------- */
 .layout {
